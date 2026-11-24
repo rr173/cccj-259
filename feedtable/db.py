@@ -20,6 +20,9 @@ Everything lives in *one* database file:
     enable time; each registered batch keeps its preconditions and writes for
     re-evaluation on withdrawal.  Indexes on the ``pk`` columns let a
     withdrawal trace only the batches a key can actually influence.
+``compaction_runs``
+    Audit records for history compactions that removed data.  No-op
+    compactions do not append rows.
 
 One database and one write transaction is deliberate: data, subscription
 definitions and pending notifications are committed or rolled back together,
@@ -151,6 +154,20 @@ CREATE INDEX IF NOT EXISTS batch_writes_pk_idx
     ON batch_writes (pk, batch_id);
 CREATE INDEX IF NOT EXISTS batch_writes_batch_idx
     ON batch_writes (batch_id, idx);
+
+-- Compaction audit ----------------------------------------------------------
+-- One row per compaction that actually removed data.  A no-op compaction does
+-- not append a row, so repeated empty runs remain state-preserving.  The JSON
+-- document contains the per-subscription frontiers and deleted/retained counts.
+CREATE TABLE IF NOT EXISTS compaction_runs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ran_at           REAL NOT NULL,
+    global_frontier  INTEGER NOT NULL,
+    deleted_groups   INTEGER NOT NULL,
+    deleted_changes  INTEGER NOT NULL,
+    commits_deleted  INTEGER NOT NULL,
+    result           TEXT NOT NULL
+);
 """
 
 

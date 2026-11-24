@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from .db import connect, init_db, read_transaction, transaction
+from .compaction import CompactionResult, SubscriptionCompaction
 from .intervals import Interval, subtract
 
 ENTER = "enter"
@@ -390,6 +391,10 @@ class Feed:
 
     def subscription(self, name: str) -> dict:
         s = self._sub_row(self.conn, name)
+        start_pending = s["acked_seq"] is None or s["acked_seq"] < s["start_seq"]
+        retention_frontier = (
+            s["start_seq"] if start_pending else s["acked_seq"]
+        )
         return {
             "name": s["name"],
             "lo": s["lo"],
@@ -398,7 +403,8 @@ class Feed:
             "start_range": [s["start_lo"], s["start_hi"]],
             "start_seq": s["start_seq"],
             "acked_seq": s["acked_seq"],
-            "start_view_pending": s["acked_seq"] is None or s["acked_seq"] < s["start_seq"],
+            "retention_frontier": retention_frontier,
+            "start_view_pending": start_pending,
         }
 
     def subscriptions(self) -> list:
@@ -797,6 +803,254 @@ class Feed:
             conn.execute(
                 "UPDATE subscriptions SET acked_seq = ? WHERE name = ?", (seq, subscription)
             )
+
+    # -- history compaction -------------------------------------------------
+    def compact(
+        self,
+        dry_run: bool = False,
+        vacuum: bool = False,
+        delete_commit_metadata: bool = True,
+    ):
+        """Delete confirmed announcement groups that no subscription needs.
+
+        The safe boundary for each subscription is:
+
+        * ``start_seq`` while its start view is unacknowledged; this retains
+          the start view and every later stored group; or
+        * ``acked_seq`` once the start view has been acknowledged.
+
+        All decisions, deletions and the compaction audit row commit through
+        one ``BEGIN IMMEDIATE`` transaction.  Sequence numbers and cursors are
+        never rewritten.  Set ``dry_run=True`` to calculate the report without
+        deleting anything.  ``vacuum=True`` runs SQLite ``VACUUM`` after the
+        transaction commits, returning free pages to the filesystem.
+        """
+        with transaction(self.conn) as conn:
+            head = self._head(conn)
+            sub_rows = self._all_subs(conn)
+
+            # Subscription names are the only owners reachable through the
+            # service (there is no unsubscribe API).  Keeping the loop driven
+            # by ``subscriptions`` avoids a full DISTINCT scan of a long
+            # announcement index; every history query below is a PK range.
+            reports: dict[str, SubscriptionCompaction] = {}
+            frontiers: dict[str, int] = {}
+            total_deleted_groups = 0
+            total_deleted_changes = 0
+            total_retained_groups = 0
+            total_retained_changes = 0
+            pending_start_views = 0
+
+            for row in sub_rows:
+                name = row["name"]
+                start_seq = row["start_seq"]
+                acked_seq = row["acked_seq"]
+                start_pending = acked_seq is None or acked_seq < start_seq
+                frontier = start_seq if start_pending else int(acked_seq)
+                frontiers[name] = frontier
+                if start_pending:
+                    pending_start_views += 1
+
+                deleted_meta = conn.execute(
+                    "SELECT MIN(seq) AS min_seq, MAX(seq) AS max_seq, "
+                    "       COUNT(*) AS n, "
+                    "       COALESCE(SUM(change_count), 0) AS changes "
+                    "FROM subscription_commits "
+                    "WHERE subscription = ? AND seq <= ?",
+                    (name, frontier),
+                ).fetchone()
+
+                if dry_run:
+                    deleted_groups = int(deleted_meta["n"])
+                    deleted_changes = int(deleted_meta["changes"])
+                else:
+                    change_cursor = conn.execute(
+                        "DELETE FROM commit_changes "
+                        "WHERE subscription = ? AND seq <= ?",
+                        (name, frontier),
+                    )
+                    group_cursor = conn.execute(
+                        "DELETE FROM subscription_commits "
+                        "WHERE subscription = ? AND seq <= ?",
+                        (name, frontier),
+                    )
+                    deleted_groups = int(group_cursor.rowcount or 0)
+                    deleted_changes = int(change_cursor.rowcount or 0)
+
+                retained = conn.execute(
+                    "SELECT MIN(seq) AS min_seq, MAX(seq) AS max_seq, "
+                    "       COUNT(*) AS n, "
+                    "       COALESCE(SUM(change_count), 0) AS changes "
+                    "FROM subscription_commits "
+                    "WHERE subscription = ? AND seq > ?",
+                    (name, frontier),
+                ).fetchone()
+
+                retained_groups = int(retained["n"])
+                retained_changes = int(retained["changes"])
+                if start_pending:
+                    earliest_kind = "start_view"
+                    earliest_needed_seq = start_seq
+                elif retained["min_seq"] is not None:
+                    earliest_kind = "commit"
+                    earliest_needed_seq = int(retained["min_seq"])
+                else:
+                    earliest_kind = "future_commit"
+                    earliest_needed_seq = head + 1
+
+                report = SubscriptionCompaction(
+                    name=name,
+                    start_seq=start_seq,
+                    acked_seq=acked_seq,
+                    start_view_pending=start_pending,
+                    retention_frontier=frontier,
+                    earliest_needed_seq=earliest_needed_seq,
+                    earliest_needed_kind=earliest_kind,
+                    earliest_retained_seq=(
+                        None if retained["min_seq"] is None
+                        else int(retained["min_seq"])
+                    ),
+                    latest_retained_seq=(
+                        None if retained["max_seq"] is None
+                        else int(retained["max_seq"])
+                    ),
+                    deleted_min_seq=(
+                        None if deleted_meta["min_seq"] is None
+                        else int(deleted_meta["min_seq"])
+                    ),
+                    deleted_max_seq=(
+                        None if deleted_meta["max_seq"] is None
+                        else int(deleted_meta["max_seq"])
+                    ),
+                    deleted_groups=deleted_groups,
+                    deleted_changes=deleted_changes,
+                    retained_groups=retained_groups,
+                    retained_changes=retained_changes,
+                )
+                reports[name] = report
+                total_deleted_groups += deleted_groups
+                total_deleted_changes += deleted_changes
+                total_retained_groups += retained_groups
+                total_retained_changes += retained_changes
+
+            global_frontier = min(frontiers.values()) if frontiers else head
+
+            commits_deleted = 0
+            commit_deleted_range = None
+            if delete_commit_metadata:
+                commit_meta = conn.execute(
+                    "SELECT MIN(seq) AS min_seq, MAX(seq) AS max_seq, COUNT(*) AS n "
+                    "FROM commits WHERE seq <= ?",
+                    (global_frontier,),
+                ).fetchone()
+                commits_deleted = int(commit_meta["n"])
+                if commit_meta["min_seq"] is not None:
+                    commit_deleted_range = [
+                        int(commit_meta["min_seq"]), int(commit_meta["max_seq"])
+                    ]
+                if not dry_run and commits_deleted:
+                    conn.execute(
+                        "DELETE FROM commits WHERE seq <= ?", (global_frontier,)
+                    )
+
+            has_effect = bool(total_deleted_groups or commits_deleted)
+            result = CompactionResult(
+                head=head,
+                global_frontier=global_frontier,
+                retention_frontiers=frontiers,
+                subscriptions=reports,
+                deleted_groups=total_deleted_groups,
+                deleted_changes=total_deleted_changes,
+                commits_deleted=commits_deleted,
+                commit_deleted_range=commit_deleted_range,
+                retained_groups=total_retained_groups,
+                retained_changes=total_retained_changes,
+                pending_start_views=pending_start_views,
+                changed=has_effect,
+                dry_run=dry_run,
+            )
+
+            if not dry_run and has_effect:
+                now = time.time()
+                cursor = conn.execute(
+                    "INSERT INTO compaction_runs "
+                    "(ran_at, global_frontier, deleted_groups, deleted_changes, "
+                    " commits_deleted, result) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        now,
+                        global_frontier,
+                        total_deleted_groups,
+                        total_deleted_changes,
+                        commits_deleted,
+                        "{}",
+                    ),
+                )
+                result.run_id = int(cursor.lastrowid)
+                result.ran_at = now
+                conn.execute(
+                    "UPDATE compaction_runs SET result = ? WHERE id = ?",
+                    (canonical_payload(result.to_dict()), result.run_id),
+                )
+
+        if vacuum and not dry_run:
+            # VACUUM cannot run inside a transaction.  The logical compaction
+            # above is already durably committed; VACUUM only packs free pages.
+            self.conn.execute("VACUUM")
+            result.vacuumed = True
+            if result.run_id is not None:
+                self.conn.execute(
+                    "UPDATE compaction_runs SET result = ? WHERE id = ?",
+                    (canonical_payload(result.to_dict()), result.run_id),
+                )
+
+        return result
+
+    # Descriptive aliases for callers and documentation.
+    compact_history = compact
+    compact_announcements = compact
+    compact_announcement_history = compact
+    compact_announcement_log = compact
+    compact_log = compact
+    compress = compact
+    compress_history = compact
+    gc = compact
+    garbage_collect = compact
+    prune = compact
+    prune_acknowledged = compact
+    prune_history = compact
+    run_compaction = compact
+    apply_compaction = compact
+
+    def last_compaction(self) -> Optional[dict]:
+        """Return the most recent persisted compaction audit, if any."""
+        row = self.conn.execute(
+            "SELECT id, ran_at, global_frontier, deleted_groups, "
+            "       deleted_changes, commits_deleted, result "
+            "FROM compaction_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        result = json.loads(row["result"])
+        result.setdefault("run_id", row["id"])
+        return result
+
+    def compaction_runs(self, limit: Optional[int] = 20) -> list[dict]:
+        """List persisted compaction audits, newest first."""
+        sql = (
+            "SELECT id, ran_at, global_frontier, deleted_groups, "
+            "       deleted_changes, commits_deleted, result "
+            "FROM compaction_runs ORDER BY id DESC"
+        )
+        args: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            args = (limit,)
+        out = []
+        for row in self.conn.execute(sql, args).fetchall():
+            item = json.loads(row["result"])
+            item.setdefault("run_id", row["id"])
+            out.append(item)
+        return out
 
     # ======================================================================
     # Batch journal

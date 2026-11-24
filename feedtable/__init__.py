@@ -46,7 +46,35 @@ from .batches import (
     WithdrawResult,
     batch_fingerprint,
 )
+from .compaction import (
+    CompactReport,
+    CompactResult,
+    Compaction,
+    CompactionReport,
+    CompactionResult,
+    RetentionReport,
+    SubscriptionCompaction,
+    SubscriptionRetention,
+)
 from .intervals import Interval, intersect, subtract
+
+
+def compact_database(path, **kwargs) -> CompactionResult:
+    """Open ``path``, run :meth:`Feed.compact`, and close the database."""
+    feed = Feed(path)
+    try:
+        return feed.compact(**kwargs)
+    finally:
+        feed.close()
+
+
+compact_feed = compact_database
+compact = compact_database
+compact_history = compact_database
+compress = compact_database
+compress_database = compact_database
+prune_history = compact_database
+run_compaction = compact_database
 
 __all__ = [
     "Batch",
@@ -55,6 +83,11 @@ __all__ = [
     "BatchSubmitResult",
     "Change",
     "CommitResult",
+    "CompactReport",
+    "CompactResult",
+    "Compaction",
+    "CompactionReport",
+    "CompactionResult",
     "Condition",
     "ENTER",
     "EXIT",
@@ -63,15 +96,26 @@ __all__ = [
     "MoveSpec",
     "ReadAudit",
     "REGISTERED",
+    "RetentionReport",
     "RowSpec",
     "SKIPPED",
     "StartView",
+    "SubscriptionCompaction",
+    "SubscriptionRetention",
     "UPDATE",
     "WITHDRAWN",
     "WithdrawAudit",
     "WithdrawResult",
     "batch_fingerprint",
     "canonical_payload",
+    "compact",
+    "compact_database",
+    "compact_feed",
+    "compact_history",
+    "compress",
+    "compress_database",
     "intersect",
+    "prune_history",
+    "run_compaction",
     "subtract",
 ]

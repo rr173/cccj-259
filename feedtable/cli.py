@@ -141,6 +141,31 @@ def cmd_ack(args):
     feed.close()
 
 
+def cmd_compact(args):
+    feed = Feed(args.db)
+    try:
+        result = feed.compact(
+            dry_run=args.dry_run,
+            vacuum=args.vacuum,
+            delete_commit_metadata=not args.keep_commit_metadata,
+        )
+        print(json.dumps(result.to_dict(), indent=2))
+    finally:
+        feed.close()
+
+
+def cmd_compaction_status(args):
+    feed = Feed(args.db)
+    try:
+        if args.limit == 1:
+            result = feed.last_compaction()
+        else:
+            result = feed.compaction_runs(limit=args.limit)
+        print(json.dumps(result, indent=2))
+    finally:
+        feed.close()
+
+
 def cmd_status(args):
     feed = Feed(args.db)
     print(json.dumps({
@@ -218,6 +243,28 @@ def build_parser():
     sp.add_argument("name")
     sp.add_argument("seq", type=int)
     sp.set_defaults(func=cmd_ack)
+
+    sp = sub.add_parser(
+        "compact",
+        aliases=["compact-history", "compact_history", "compact-announcements",
+                 "compress", "gc", "prune", "prune-history", "prune_history"],
+        help="delete confirmed announcement groups safe for every subscription",
+    )
+    sp.add_argument("--dry-run", action="store_true",
+                    help="calculate and print the reclaimable range without deleting")
+    sp.add_argument("--vacuum", action="store_true",
+                    help="run SQLite VACUUM after commit to shrink the database file")
+    sp.add_argument("--keep-commit-metadata", action="store_true",
+                    help="retain the global commits/audit rows even below the safe frontier")
+    sp.set_defaults(func=cmd_compact)
+
+    sp = sub.add_parser(
+        "compaction-status",
+        aliases=["compactions"],
+        help="show persisted compaction audit records",
+    )
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(func=cmd_compaction_status)
 
     sp = sub.add_parser("status", help="head and subscriptions")
     sp.set_defaults(func=cmd_status)

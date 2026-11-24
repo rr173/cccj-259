@@ -11,7 +11,8 @@ feedtable/
   db.py         schema + 事务封装（BEGIN IMMEDIATE / 读快照）
   intervals.py  半开区间与集合差
   batches.py    批次值对象、前置条件与内容指纹
-  core.py       Feed：建订、提交事务、读取通告、确认、批次登记与撤回
+  compaction.py 压缩报告值对象
+  core.py       Feed：建订、提交事务、读取通告、确认、压缩、批次登记与撤回
   cli.py        命令行（每次调用一个进程，模拟随时崩溃的运维方式）
 examples/consumer.py   只用投递内容的参考消费者
 tests/                 102 个可执行检查（含随机差分测试）
@@ -61,6 +62,7 @@ python -m feedtable --db roster.db subscribe qc-a 0 100
 python -m feedtable --db roster.db apply --tx tx.json      # 见 cli.py 文档
 python -m feedtable --db roster.db pending qc-a
 python -m feedtable --db roster.db ack qc-a 3
+python -m feedtable --db roster.db compact --vacuum
 ```
 
 ## 语义
@@ -101,6 +103,88 @@ python -m feedtable --db roster.db ack qc-a 3
 **原子性**：数据、订阅定义、待发通告在同一个数据库、同一个写事务中落定
 （WAL + `synchronous=FULL`）。提交前崩溃 → 全部回滚；提交后崩溃 → 全部持久。
 客户端不可能看到部分结果。
+
+## 历史压缩（回收已确认通告）
+
+`compact()` 只删除**当前已有订阅不再需要的、按订阅持久化的通告组**
+（`subscription_commits` 与其 `commit_changes`），不会重编号，也不要求客户端
+清库重订。
+
+每个订阅的安全删除前沿按下面的规则确定：
+
+- 起始视图尚未确认（`acked_seq IS NULL` 或仍小于 `start_seq`）：
+  `retention_frontier = start_seq`。起始视图原样保留，`seq > start_seq`
+  的所有在途通告也全部保留；
+- 起始视图已确认：`retention_frontier = acked_seq`。该订阅自己的
+  `seq <= acked_seq` 组可以删除，`seq > acked_seq` 的未确认组按原序号、原内容、
+  原顺序保留。
+
+因为每个订阅的变化组本来就以 `(subscription, seq)` 分别存储，压缩会按各订阅
+自己的前沿删除其已确认副本；一个落后的质检客户端只会保住**它自己的**副本，
+不会阻止其他订阅回收各自已经确认的副本。返回值同时给出所有前沿中最小的
+`global_frontier`；共享的 `commits` 序号/审计行只删除 `seq <= global_frontier`
+的完整旧前缀。`subscription_start_view` 中的建订起始视图始终不删，订阅区间、
+`start_seq`、`acked_seq` 和未确认消息均不修改。
+
+```python
+from feedtable import Feed, compact_database
+
+with Feed("roster.db") as feed:
+    report = feed.compact()
+    print(report.retention_frontiers)   # {"qc-a": 7, "qc-b": 3}
+    print(report.deleted_ranges)        # {"qc-a": [1, 7], "qc-b": [1, 3]}
+    print(report.deleted_count)         # 删除的通告组数量
+    print(report.retained_count)        # 仍保留的提交通告组数量
+    print(report.to_dict())
+
+# 也可以不手动管理 Feed：
+report = compact_database("roster.db", vacuum=True)
+```
+
+常用字段/别名：
+
+| 字段 | 含义 |
+| --- | --- |
+| `retention_frontiers` / `frontiers` | 每个订阅最后一个可安全删除到的序号（含） |
+| `earliest_needed_seqs` | 每个订阅仍需要的起始视图或最早保留组序号 |
+| `subscriptions[name]` | 单订阅前沿、删除范围/组数/变化条数、保留范围/数量 |
+| `deleted_ranges` / `ranges` | 各订阅实际删除的 `[最小seq, 最大seq]`；无删除为 `None` |
+| `deleted_count` / `deleted_groups` | 删除的通告组数量（空的挪区间组也算一个组） |
+| `deleted_changes` | 删除的净变化行数量 |
+| `retained_count` / `retained_groups` | 压缩后仍保留的提交通告组数量 |
+| `retained_messages` | 保留组数 + 仍待确认的起始视图消息数 |
+| `global_frontier` | 所有订阅前沿的最小值；无订阅时为当前 `head` |
+| `changed` | 本次是否确实删除了通告组或旧 `commits` 元数据 |
+
+没有可回收内容时，`compact()` 返回零删除报告且不写入新的压缩记录；重复执行结果
+相同。压缩不会调用 `_store_commit`、不推进 `next_seq`，因此不产生新通告，后续
+写入仍得到递增序号。
+
+判断只读取 `subscriptions` 的进度/起始边界以及 `subscription_commits`、
+`commits` 中的序号元数据（主键/索引范围与聚合计数），不扫描 `records`，也不
+重放批次条件或写入明细。判断、`commit_changes`/`subscription_commits`/`commits`
+删除以及 `compaction_runs` 审计记录都在同一个 `BEGIN IMMEDIATE` 事务中提交；
+事务内任何错误都会整体回滚。重开数据库后只会看到完整的压缩前或压缩后状态。
+
+SQLite 的普通 `DELETE` 会释放页给同一数据库后续使用，但不一定缩小操作系统看到
+的文件。需要把空间交还给磁盘时使用 `vacuum=True` 或 CLI 的 `--vacuum`；
+`VACUUM` 在压缩事务提交后执行，只负责整理物理文件。
+
+命令行：
+
+```bash
+# 只计算可回收范围，不删除
+python -m feedtable --db roster.db compact --dry-run
+
+# 执行压缩，并在提交后 VACUUM 收缩文件
+python -m feedtable --db roster.db compact --vacuum
+
+# 查看最近一次/历次压缩审计
+python -m feedtable --db roster.db compaction-status --limit 1
+```
+
+`compact-history`、`prune` 是 `compact` 的命令别名；Python 方法也提供
+`compact_history()`、`compact_announcement_history()` 和 `prune()` 别名。
 
 ## 读取代价
 
