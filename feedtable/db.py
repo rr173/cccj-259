@@ -14,6 +14,12 @@ Everything lives in *one* database file:
     The append-only notification stream.  One write transaction produces one
     ``commits`` row and one ``subscription_commits`` row per affected
     subscription; net per-pk changes live in ``commit_changes``.
+``baseline_records`` / ``batches`` / ``batch_conditions`` / ``batch_writes``
+    The batch journal, present once batch journaling is enabled.
+    ``baseline_records`` is the immutable, non-revocable table as it stood at
+    enable time; each registered batch keeps its preconditions and writes for
+    re-evaluation on withdrawal.  Indexes on the ``pk`` columns let a
+    withdrawal trace only the batches a key can actually influence.
 
 One database and one write transaction is deliberate: data, subscription
 definitions and pending notifications are committed or rolled back together,
@@ -97,6 +103,54 @@ CREATE TABLE IF NOT EXISTS commit_changes (
     payload      TEXT,
     PRIMARY KEY (subscription, seq, idx)
 );
+
+-- Batch journal -------------------------------------------------------------
+-- Enabling batch journaling snapshots the whole record table into
+-- ``baseline_records``: that snapshot is the non-revocable starting point.
+-- Every later record write must arrive through a registered batch.
+CREATE TABLE IF NOT EXISTS baseline_records (
+    pk      TEXT PRIMARY KEY,
+    route   INTEGER NOT NULL,
+    payload TEXT
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id      TEXT PRIMARY KEY,
+    seq           INTEGER NOT NULL UNIQUE,   -- first-registration order
+    status        TEXT NOT NULL CHECK (status IN ('registered', 'skipped', 'withdrawn')),
+    fingerprint   TEXT NOT NULL,
+    notify_seq    INTEGER,                   -- notification seq when effective
+    created_at    REAL NOT NULL,
+    last_change_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_conditions (
+    batch_id TEXT    NOT NULL,
+    idx      INTEGER NOT NULL,
+    pk       TEXT    NOT NULL,
+    kind     TEXT    NOT NULL CHECK (kind IN ('absent', 'matches')),
+    route    INTEGER,
+    payload  TEXT,
+    PRIMARY KEY (batch_id, idx)
+);
+-- The withdrawal impact closure follows primary keys through the journal;
+-- these two indexes make every step a primary-key lookup, never a scan.
+CREATE INDEX IF NOT EXISTS batch_conditions_pk_idx
+    ON batch_conditions (pk, batch_id);
+
+CREATE TABLE IF NOT EXISTS batch_writes (
+    batch_id  TEXT    NOT NULL,
+    idx       INTEGER NOT NULL,
+    pk        TEXT    NOT NULL,
+    is_delete INTEGER NOT NULL CHECK (is_delete IN (0, 1)),
+    route     INTEGER,
+    payload   TEXT,
+    PRIMARY KEY (batch_id, idx)
+);
+CREATE INDEX IF NOT EXISTS batch_writes_pk_idx
+    ON batch_writes (pk, batch_id);
+CREATE INDEX IF NOT EXISTS batch_writes_batch_idx
+    ON batch_writes (batch_id, idx);
 """
 
 

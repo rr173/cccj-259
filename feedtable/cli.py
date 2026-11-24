@@ -32,6 +32,7 @@ import json
 import sys
 
 from .core import Feed, MoveSpec, RowSpec
+from .batches import BatchRequest, Condition
 
 
 def _load_json(path):
@@ -53,6 +54,26 @@ def _transaction_from(obj):
         MoveSpec(m["subscription"], m["lo"], m["hi"]) for m in obj.get("moves", [])
     ]
     return writes, moves, obj.get("meta")
+
+
+def _batch_request_from(obj):
+    """Build a :class:`BatchRequest` from an operator JSON document.
+
+    Accepted condition shapes::
+
+        {"pk": "sku-1", "kind": "absent"}
+        {"pk": "sku-2", "kind": "matches", "route": 7, "payload": {"v": 1}}
+
+    Writes reuse the transaction shape (``delete: true`` or route + payload).
+    """
+    conditions = [Condition.from_dict(c) for c in obj.get("conditions", [])]
+    writes = []
+    for spec in obj["writes"]:
+        if spec.get("delete"):
+            writes.append(RowSpec.delete_pk(spec["pk"]))
+        else:
+            writes.append(RowSpec(spec["pk"], spec["route"], spec.get("payload")))
+    return BatchRequest(obj["batch_id"], conditions, writes)
 
 
 def cmd_init(args):
@@ -124,9 +145,43 @@ def cmd_status(args):
     feed = Feed(args.db)
     print(json.dumps({
         "head": feed.head(),
+        "batches_enabled": feed.batches_enabled(),
         "subscriptions": feed.subscriptions(),
     }, indent=2))
     feed.close()
+
+
+def cmd_enable_batches(args):
+    feed = Feed(args.db)
+    result = feed.enable_batches()
+    result["batches_enabled"] = feed.batches_enabled()
+    feed.close()
+    print(json.dumps(result, indent=2))
+
+
+def cmd_batch_submit(args):
+    feed = Feed(args.db)
+    request = _batch_request_from(_load_json(args.tx))
+    result = feed.submit_batch(request)
+    feed.close()
+    print(json.dumps(result.to_dict(), indent=2))
+
+
+def cmd_batch_withdraw(args):
+    feed = Feed(args.db)
+    result = feed.withdraw_batch(args.batch_id)
+    feed.close()
+    print(json.dumps(result.to_dict(), indent=2))
+
+
+def cmd_batch_status(args):
+    feed = Feed(args.db)
+    if args.batch_id:
+        result = feed.batch_status(args.batch_id).to_dict()
+    else:
+        result = [s.to_dict() for s in feed.batches()]
+    feed.close()
+    print(json.dumps(result, indent=2))
 
 
 def build_parser():
@@ -166,6 +221,30 @@ def build_parser():
 
     sp = sub.add_parser("status", help="head and subscriptions")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser(
+        "enable-batches",
+        help="snapshot the table and make batch journaling the only write path",
+    )
+    sp.set_defaults(func=cmd_enable_batches)
+
+    sp = sub.add_parser(
+        "batch-submit",
+        help="register and evaluate one batch from a JSON document (--tx)",
+    )
+    sp.add_argument("--tx", required=True, help="JSON batch file ('-' for stdin)")
+    sp.set_defaults(func=cmd_batch_submit)
+
+    sp = sub.add_parser("batch-withdraw", help="revoke one batch by id")
+    sp.add_argument("batch_id")
+    sp.set_defaults(func=cmd_batch_withdraw)
+
+    sp = sub.add_parser(
+        "batch-status",
+        help="show one batch, or the whole journal in registration order",
+    )
+    sp.add_argument("batch_id", nargs="?")
+    sp.set_defaults(func=cmd_batch_status)
     return p
 
 
@@ -173,7 +252,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except (KeyError, ValueError, TypeError) as exc:
+    except (KeyError, ValueError, TypeError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0

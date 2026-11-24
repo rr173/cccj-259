@@ -53,6 +53,10 @@ KINDS = (ENTER, UPDATE, EXIT)
 
 _UNSET = object()
 
+#: Sentinel for "no row exists at this key at this point in the replay".  It is
+#: distinct from a real row whose payload is ``NULL``.
+_ABSENT = object()
+
 #: The only range scan shape this module is allowed to run.  ``INDEXED BY``
 #: pins the plan so a schema change cannot silently turn it into a full scan.
 _SEGMENT_SQL = (
@@ -60,6 +64,43 @@ _SEGMENT_SQL = (
     "WHERE route >= ? AND route < ? ORDER BY route, pk"
 )
 _START_VIEW_SQL = _SEGMENT_SQL
+
+#: Point lookups used while evaluating a batch against the live record table.
+_RECORD_POINT_SQL = "SELECT pk, route, payload FROM records WHERE pk = ?"
+
+#: Batch-journal lookups.  Every one is a primary-key / indexed equality lookup:
+#: withdrawal tracing is a closure of key follow-ups, never a journal scan.
+_BATCH_BY_ID_SQL = (
+    "SELECT batch_id, seq, status, fingerprint, notify_seq, created_at, "
+    "last_change_at FROM batches WHERE batch_id = ?"
+)
+_CONDITIONS_OF_SQL = (
+    "SELECT idx, pk, kind, route, payload FROM batch_conditions "
+    "WHERE batch_id = ? ORDER BY idx"
+)
+_WRITES_OF_SQL = (
+    "SELECT idx, pk, is_delete, route, payload FROM batch_writes "
+    "WHERE batch_id = ? ORDER BY idx"
+)
+#: Batches that reference a key in the ``IN (...)`` list, either as a
+#: precondition or as a write.  Both supporting indexes lead with ``pk``, so
+#: the closure expansion stays an indexed lookup as it grows; forward-only and
+#: already-reached filtering is done in Python against the numeric ``seq``.
+_COND_REFS_SQL = (
+    "SELECT DISTINCT batch_id FROM batch_conditions WHERE pk IN ({marks})"
+)
+_WRITE_REFS_SQL = (
+    "SELECT DISTINCT batch_id FROM batch_writes WHERE pk IN ({marks})"
+)
+_BASELINE_POINT_SQL = (
+    "SELECT pk, route, payload FROM baseline_records WHERE pk = ?"
+)
+_JOURNAL_EVENTS_SQL = (
+    "SELECT b.seq AS bseq, w.batch_id, b.status, w.idx, w.pk, w.is_delete, "
+    "w.route, w.payload FROM batch_writes AS w "
+    "JOIN batches AS b ON b.batch_id = w.batch_id "
+    "WHERE w.pk IN ({marks}) ORDER BY b.seq, w.idx"
+)
 
 
 def canonical_payload(payload):
@@ -327,6 +368,17 @@ class Feed:
         return int(row["value"])
 
     @staticmethod
+    def _meta_value(conn, key, default=None):
+        row = conn.execute(
+            "SELECT value FROM feed_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return default if row is None else row["value"]
+
+    def batches_enabled(self) -> bool:
+        """Whether batch journaling is enabled on this database."""
+        return self._meta_value(self.conn, "batch_mode") == "on"
+
+    @staticmethod
     def _read_audit_plan(conn):
         return [
             r["detail"] for r in conn.execute("EXPLAIN QUERY PLAN " + _SEGMENT_SQL, (0, 0))
@@ -452,6 +504,14 @@ class Feed:
                 )
             move_map[m.subscription] = m.interval
 
+        # Once batch journaling is on, record writes only enter through
+        # submit_batch.  Range moves (and read/ack) keep using this entry.
+        if writes and self.batches_enabled():
+            raise RuntimeError(
+                "batch journaling is enabled: record writes must be submitted "
+                "via Feed.submit_batch; apply() may only move subscription ranges"
+            )
+
         audit = ReadAudit()
         with transaction(self.conn) as conn:
             subs = {r["name"]: r for r in self._all_subs(conn)}
@@ -492,77 +552,9 @@ class Feed:
                 )
 
             # (4) Net changes per subscription from before/after visibility.
-            changes_by_sub: dict[str, list[Change]] = {}
-            segment_cache: dict[tuple, dict] = {}
-            planned = self._read_audit_plan(conn)
-            written_pks = set(final)
-
-            def segment_rows(seg: Interval, label: str, for_sub: str) -> dict:
-                key = (seg.lo, seg.hi)
-                cached = segment_cache.get(key)
-                if cached is None:
-                    scan = ScanAudit(label, key, _SEGMENT_SQL, planned, 0, 0, [])
-                    rows = conn.execute(_SEGMENT_SQL, (seg.lo, seg.hi)).fetchall()
-                    scan.rows = len(rows)
-                    scan.excluded_written = sum(1 for r in rows if r["pk"] in written_pks)
-                    cached = {
-                        "rows": {r["pk"]: r for r in rows if r["pk"] not in written_pks},
-                        "audit": scan,
-                    }
-                    segment_cache[key] = cached
-                    audit.scans.append(scan)
-                if for_sub not in cached["audit"].for_subscriptions:
-                    cached["audit"].for_subscriptions.append(for_sub)
-                return cached["rows"]
-
-            for name, sub in subs.items():
-                old_iv = Interval(sub["lo"], sub["hi"])
-                new_iv = move_map.get(name, old_iv)
-
-                if new_iv == old_iv:
-                    added, removed = [], []
-                    audit.retained.setdefault(name, None)
-                else:
-                    added = subtract(new_iv, old_iv)
-                    removed = subtract(old_iv, new_iv)
-                    audit.allowed[name] = [(s.lo, s.hi) for s in added + removed]
-                    inter_lo, inter_hi = max(old_iv.lo, new_iv.lo), min(old_iv.hi, new_iv.hi)
-                    audit.retained[name] = (
-                        (inter_lo, inter_hi) if inter_lo < inter_hi else None
-                    )
-
-                visible_before = {
-                    pk: row for pk, row in before.items() if old_iv.contains(row["route"])
-                }
-                visible_after = {
-                    pk: row for pk, row in after.items() if new_iv.contains(row["route"])
-                }
-
-                for seg in added:
-                    label = f"{name}:enter[{seg.lo},{seg.hi})"
-                    visible_after.update(segment_rows(seg, label, name))
-                for seg in removed:
-                    label = f"{name}:exit[{seg.lo},{seg.hi})"
-                    visible_before.update(segment_rows(seg, label, name))
-
-                changes = []
-                for pk in sorted(set(visible_before) | set(visible_after)):
-                    b = visible_before.get(pk)
-                    a = visible_after.get(pk)
-                    if b is None:
-                        changes.append(Change(ENTER, pk, a["route"], a["payload"]))
-                    elif a is None:
-                        changes.append(Change(EXIT, pk, b["route"], b["payload"]))
-                    elif b["route"] != a["route"] or b["payload"] != a["payload"]:
-                        changes.append(Change(UPDATE, pk, a["route"], a["payload"]))
-                    # else: visible both, delivered row identical -> no change.
-
-                if changes:
-                    changes_by_sub[name] = changes
-                elif name in move_map and new_iv != old_iv:
-                    # A move is an event in the stream even when it exposes
-                    # nothing new: the client still needs the new boundary.
-                    changes_by_sub[name] = []
+            changes_by_sub = self._net_changes_for_subs(
+                conn, subs, move_map, before, after, set(final), audit
+            )
 
             if not changes_by_sub:
                 # Nothing observable happened.  Record writes still commit,
@@ -573,17 +565,108 @@ class Feed:
             seq = self._store_commit(conn, changes_by_sub, meta, move_map, subs, audit)
             return CommitResult(seq, changes_by_sub, audit, committed=True)
 
-    def _store_commit(self, conn, changes_by_sub, meta, move_map, subs, audit):
+    def _net_changes_for_subs(
+        self, conn, subs, move_map, before, after, written_pks, audit
+    ):
+        """Compute the per-subscription net change groups for one operation.
+
+        ``before`` / ``after`` map pk to a row dict (``pk``/``route``/
+        ``payload``) for every row the operation itself wrote.  Visibility is
+        decided from those images plus bounded segment scans of the regions a
+        range move adds or removes; retained and out-of-range rows are never
+        read.  The same routine serves ordinary :meth:`apply` transactions,
+        effective batch submissions and withdrawal corrections (the latter
+        pass an empty ``move_map``).
+        """
+        changes_by_sub: dict[str, list[Change]] = {}
+        segment_cache: dict[tuple, dict] = {}
+        planned = self._read_audit_plan(conn)
+
+        def segment_rows(seg: Interval, label: str, for_sub: str) -> dict:
+            key = (seg.lo, seg.hi)
+            cached = segment_cache.get(key)
+            if cached is None:
+                scan = ScanAudit(label, key, _SEGMENT_SQL, planned, 0, 0, [])
+                rows = conn.execute(_SEGMENT_SQL, (seg.lo, seg.hi)).fetchall()
+                scan.rows = len(rows)
+                scan.excluded_written = sum(1 for r in rows if r["pk"] in written_pks)
+                cached = {
+                    "rows": {r["pk"]: r for r in rows if r["pk"] not in written_pks},
+                    "audit": scan,
+                }
+                segment_cache[key] = cached
+                audit.scans.append(scan)
+            if for_sub not in cached["audit"].for_subscriptions:
+                cached["audit"].for_subscriptions.append(for_sub)
+            return cached["rows"]
+
+        for name, sub in subs.items():
+            old_iv = Interval(sub["lo"], sub["hi"])
+            new_iv = move_map.get(name, old_iv)
+
+            if new_iv == old_iv:
+                added, removed = [], []
+                audit.retained.setdefault(name, None)
+            else:
+                added = subtract(new_iv, old_iv)
+                removed = subtract(old_iv, new_iv)
+                audit.allowed[name] = [(s.lo, s.hi) for s in added + removed]
+                inter_lo, inter_hi = max(old_iv.lo, new_iv.lo), min(old_iv.hi, new_iv.hi)
+                audit.retained[name] = (
+                    (inter_lo, inter_hi) if inter_lo < inter_hi else None
+                )
+
+            visible_before = {
+                pk: row for pk, row in before.items() if old_iv.contains(row["route"])
+            }
+            visible_after = {
+                pk: row for pk, row in after.items() if new_iv.contains(row["route"])
+            }
+
+            for seg in added:
+                label = f"{name}:enter[{seg.lo},{seg.hi})"
+                visible_after.update(segment_rows(seg, label, name))
+            for seg in removed:
+                label = f"{name}:exit[{seg.lo},{seg.hi})"
+                visible_before.update(segment_rows(seg, label, name))
+
+            changes = []
+            for pk in sorted(set(visible_before) | set(visible_after)):
+                b = visible_before.get(pk)
+                a = visible_after.get(pk)
+                if b is None:
+                    changes.append(Change(ENTER, pk, a["route"], a["payload"]))
+                elif a is None:
+                    changes.append(Change(EXIT, pk, b["route"], b["payload"]))
+                elif b["route"] != a["route"] or b["payload"] != a["payload"]:
+                    changes.append(Change(UPDATE, pk, a["route"], a["payload"]))
+                # else: visible both, delivered row identical -> no change.
+
+            if changes:
+                changes_by_sub[name] = changes
+            elif name in move_map and new_iv != old_iv:
+                # A move is an event in the stream even when it exposes
+                # nothing new: the client still needs the new boundary.
+                changes_by_sub[name] = []
+        return changes_by_sub
+
+    def _store_commit(self, conn, changes_by_sub, meta, move_map, subs, audit,
+                      extra_audit=None):
         """Allocate the sequence number and persist the groups with it.
 
         The read audit is stored alongside the commit so the candidate-read
         count can be checked after the fact, not just from the return value.
+        ``extra_audit`` (used by batch withdrawals) is merged into the stored
+        audit so the batch ids touched by a correction stay reviewable.
         """
         seq = self._head(conn) + 1
+        audit_dict = audit.to_dict()
+        if extra_audit:
+            audit_dict.update(extra_audit)
         conn.execute(
             "INSERT INTO commits (seq, created_at, meta, audit) VALUES (?, ?, ?, ?)",
             (seq, time.time(), canonical_payload(meta or {}),
-             canonical_payload(audit.to_dict())),
+             canonical_payload(audit_dict)),
         )
         conn.execute("UPDATE feed_meta SET value = ? WHERE key = 'next_seq'", (str(seq),))
 
@@ -714,3 +797,557 @@ class Feed:
             conn.execute(
                 "UPDATE subscriptions SET acked_seq = ? WHERE name = ?", (seq, subscription)
             )
+
+    # ======================================================================
+    # Batch journal
+    # ======================================================================
+    def enable_batches(self) -> dict:
+        """Turn on batch journaling.
+
+        The record table as it stands right now is snapshotted into
+        ``baseline_records`` and becomes the non-revocable starting point:
+        earlier writes are never re-interpreted or withdrawn.  After this
+        returns, every record insert/update/delete must go through
+        :meth:`submit_batch`; a direct :meth:`apply` carrying writes is
+        rejected.  Enabling twice is an idempotent no-op.
+        """
+        from .batches import REGISTERED  # local import: avoid an import cycle
+
+        with transaction(self.conn) as conn:
+            if self._meta_value(conn, "batch_mode") == "on":
+                return {"enabled": False, "baseline_rows":
+                        conn.execute("SELECT count(*) FROM baseline_records").fetchone()[0]}
+            conn.execute(
+                "INSERT INTO baseline_records (pk, route, payload) "
+                "SELECT pk, route, payload FROM records"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO feed_meta (key, value) "
+                "VALUES ('batch_mode', 'on')"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO feed_meta (key, value) "
+                "VALUES ('next_batch_seq', '0')"
+            )
+            baseline_rows = conn.execute(
+                "SELECT count(*) FROM baseline_records"
+            ).fetchone()[0]
+        return {"enabled": True, "baseline_rows": baseline_rows}
+
+    # -- condition evaluation ---------------------------------------------
+    @staticmethod
+    def _condition_holds(conn, cond, audit):
+        """Evaluate one precondition against the live table.
+
+        ``absent`` holds only when no row exists at all (a NULL-payload row is
+        still a row).  ``matches`` holds only for an existing row whose route
+        and payload are byte-for-byte the expected ones.
+        """
+        row = conn.execute(_RECORD_POINT_SQL, (cond.pk,)).fetchone()
+        audit.point_lookups += 1
+        if cond.kind == "absent":
+            return row is None
+        if row is None:
+            return False
+        return row["route"] == cond.route and row["payload"] == cond.payload_value
+
+    def _register_batch_rows(self, conn, request, fingerprint, status, notify_seq):
+        """Insert the journal rows for a newly registered batch."""
+        now = time.time()
+        bseq = int(self._meta_value(conn, "next_batch_seq", "0")) + 1
+        conn.execute(
+            "UPDATE feed_meta SET value = ? WHERE key = 'next_batch_seq'", (str(bseq),)
+        )
+        conn.execute(
+            "INSERT INTO batches (batch_id, seq, status, fingerprint, notify_seq, "
+            "created_at, last_change_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (request.batch_id, bseq, status, fingerprint, notify_seq, now, now),
+        )
+        conn.executemany(
+            "INSERT INTO batch_conditions (batch_id, idx, pk, kind, route, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(request.batch_id, i, c.pk, c.kind, c.route, c.payload_value)
+             for i, c in enumerate(request.conditions)],
+        )
+        conn.executemany(
+            "INSERT INTO batch_writes (batch_id, idx, pk, is_delete, route, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(request.batch_id, i, w.pk, 1 if w.delete else 0,
+              None if w.delete else w.route, None if w.delete else w.payload_value)
+             for i, w in enumerate(request.writes)],
+        )
+        return bseq
+
+    # -- batch submission ---------------------------------------------------
+    def submit_batch(self, request) -> "BatchSubmitResult":
+        """Register and evaluate one batch atomically.
+
+        All preconditions see the table immediately before this batch.  If they
+        all hold, the writes take effect in one transaction with their
+        subscription notifications; otherwise no row changes, but the batch is
+        still registered as ``skipped``.  Retrying the same id with identical
+        content returns the stored outcome without re-registering; different
+        content under the same id is rejected and changes nothing.
+        """
+        from .batches import (
+            BatchRequest, BatchSubmitResult, REGISTERED, SKIPPED,
+            batch_fingerprint,
+        )
+
+        if not isinstance(request, BatchRequest):
+            raise TypeError("submit_batch expects a BatchRequest")
+        fingerprint = batch_fingerprint(request)
+
+        with transaction(self.conn) as conn:
+            if self._meta_value(conn, "batch_mode") != "on":
+                raise RuntimeError(
+                    "batch journaling is not enabled; call Feed.enable_batches() first"
+                )
+            existing = conn.execute(_BATCH_BY_ID_SQL, (request.batch_id,)).fetchone()
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    raise ValueError(
+                        f"batch {request.batch_id!r} already registered with "
+                        "different content"
+                    )
+                # Idempotent retry: nothing is re-registered or rewritten.
+                return BatchSubmitResult(
+                    request.batch_id, existing["seq"], registered=False,
+                    applied=existing["status"] == REGISTERED,
+                    notify_seq=existing["notify_seq"], fingerprint=fingerprint,
+                )
+
+            audit = ReadAudit()
+            holds = [self._condition_holds(conn, c, audit) for c in request.conditions]
+            if not all(holds):
+                bseq = self._register_batch_rows(
+                    conn, request, fingerprint, SKIPPED, None
+                )
+                return BatchSubmitResult(
+                    request.batch_id, bseq, registered=True, applied=False,
+                    notify_seq=None, fingerprint=fingerprint,
+                )
+
+            # Preconditions hold: take before images, apply the writes, then
+            # derive subscription net changes exactly like apply() does.
+            before, after = {}, {}
+            for w in request.writes:
+                row = conn.execute(_RECORD_POINT_SQL, (w.pk,)).fetchone()
+                audit.point_lookups += 1
+                if row is not None:
+                    before[w.pk] = row
+                if w.delete:
+                    conn.execute("DELETE FROM records WHERE pk = ?", (w.pk,))
+                else:
+                    conn.execute(
+                        "INSERT INTO records (pk, route, payload) VALUES (?, ?, ?) "
+                        "ON CONFLICT(pk) DO UPDATE SET route = excluded.route, "
+                        "payload = excluded.payload",
+                        (w.pk, w.route, w.payload_value),
+                    )
+                    after[w.pk] = {
+                        "pk": w.pk, "route": w.route, "payload": w.payload_value,
+                    }
+
+            subs = {r["name"]: r for r in self._all_subs(conn)}
+            changes_by_sub = self._net_changes_for_subs(
+                conn, subs, {}, before, after, {w.pk for w in request.writes}, audit
+            )
+            notify_seq = None
+            if changes_by_sub:
+                notify_seq = self._store_commit(
+                    conn, changes_by_sub,
+                    {"batch_id": request.batch_id, "kind": "batch"},
+                    {}, subs, audit,
+                )
+            bseq = self._register_batch_rows(
+                conn, request, fingerprint, REGISTERED, notify_seq
+            )
+            return BatchSubmitResult(
+                request.batch_id, bseq, registered=True, applied=True,
+                notify_seq=notify_seq, changes=changes_by_sub,
+                fingerprint=fingerprint,
+            )
+
+    # -- withdrawal ---------------------------------------------------------
+    def withdraw_batch(self, batch_id: str):
+        """Revoke one registered batch and settle everything in one transaction.
+
+        The table is re-understood from the enable-time baseline: the withdrawn
+        batch is skipped, and every still-active batch it could have influenced
+        is re-evaluated in original registration order.  Batches unrelated by
+        primary key are never read.  Subscribers receive one net correction
+        group built from the real before/after row difference; repeat
+        withdrawal of the same id changes nothing, an unknown id is an error.
+        """
+        from .batches import (
+            REGISTERED, SKIPPED, WITHDRAWN, WithdrawAudit, WithdrawResult,
+        )
+
+        if not isinstance(batch_id, str) or not batch_id:
+            raise TypeError("batch_id must be a non-empty string")
+
+        with transaction(self.conn) as conn:
+            if self._meta_value(conn, "batch_mode") != "on":
+                raise RuntimeError("batch journaling is not enabled")
+            target = conn.execute(_BATCH_BY_ID_SQL, (batch_id,)).fetchone()
+            if target is None:
+                raise KeyError(f"unknown batch {batch_id!r}")
+            if target["status"] == WITHDRAWN:
+                # Repeated withdrawal is a stable no-op.
+                return WithdrawResult(
+                    batch_id, changed=False, notify_seq=None,
+                    statuses=self._batch_statuses(conn, (batch_id,)),
+                )
+
+            audit = WithdrawAudit(withdrawn_batch=batch_id)
+            read_ids = {batch_id}
+
+            # A batch that never took effect applied no rows: its withdrawal
+            # cannot change the table or any later evaluation, so nothing is
+            # replayed.  Its own details are the only journal data consulted.
+            if target["status"] == SKIPPED:
+                conn.execute(
+                    "UPDATE batches SET status = ?, last_change_at = ? "
+                    "WHERE batch_id = ?",
+                    (WITHDRAWN, time.time(), batch_id),
+                )
+                # Touch the stored details so the read report is truthful.
+                self._batch_keys(conn, batch_id, audit)
+                audit.read_batches = sorted(read_ids)
+                return WithdrawResult(
+                    batch_id, changed=False, notify_seq=None,
+                    statuses=self._batch_statuses(conn, (batch_id,)),
+                    audit=audit,
+                )
+
+            # (1) Closure of batches this withdrawal can influence, built by a
+            # deterministic fixpoint over *affected primary keys*, processed in
+            # registration order.
+            #
+            # ``affected_keys`` starts with the effective target's write keys
+            # (a skipped target returned above).  A later, not-withdrawn batch
+            # is admitted when it either writes an affected key or reads one as
+            # a precondition - exactly the spec's "reads that key as a
+            # condition or writes that key" rule.  A reached batch's status can
+            # change either way (an effective batch may flip to skipped and
+            # stop writing; a skipped one may flip to effective and start), so
+            # every reached batch contributes the keys it writes, and a reached
+            # *skipped* batch also contributes its gate keys (whether its gate
+            # now holds decides everything downstream).  Batches are processed
+            # in seq order; the indexed pk lookup is repeated only while new
+            # batches join, so unrelated batches are never opened and neither
+            # the journal nor the record table is scanned.
+            affected: dict[int, str] = {target["seq"]: batch_id}
+            touched = set(self._write_keys(conn, batch_id, audit))
+            affected_keys = set(self._write_keys(conn, batch_id, audit))
+            while True:
+                candidates = self._referencing_write_batches(
+                    conn, affected_keys, target["seq"], audit
+                ) + self._referencing_condition_batches(
+                    conn, affected_keys, target["seq"], audit
+                )
+                pending = sorted(
+                    (c for c in candidates
+                     if c[0] not in affected and c[2] != WITHDRAWN),
+                    key=lambda c: c[0],
+                )
+                added_keys = set()
+                admitted = 0
+                for bseq, bid, status in pending:
+                    cond = set(self._condition_keys(conn, bid, audit))
+                    write = set(self._write_keys(conn, bid, audit))
+                    via_write = bool(write & affected_keys)
+                    via_cond = bool(cond & affected_keys)
+                    if not (via_write or via_cond):
+                        continue
+                    affected[bseq] = bid
+                    admitted += 1
+                    read_ids.add(bid)
+                    touched.update(write | cond)
+                    # Its writes may appear or disappear in the new settlement.
+                    added_keys.update(write)
+                    if status == SKIPPED:
+                        # Its gate may newly hold; those keys drive later gates.
+                        added_keys.update(cond)
+                # Settle only when no new batch joined; new keys drive the next
+                # round's candidate lookup.
+                if admitted == 0:
+                    break
+                affected_keys |= added_keys
+            audit.affected_batches = [bid for _, bid in sorted(affected.items())]
+
+            # (2) Every key the re-evaluation can observe.  ``touched`` already
+            # holds the target's keys plus every key added while expanding the
+            # closure, including keys only read as preconditions, so outside
+            # writers of such a key are replayed as fixed events rather than
+            # silently assumed constant.
+            boundary, events = self._key_timelines(conn, touched, affected, audit)
+            read_ids.update(events["read_batches"])
+
+            # (3) Walk the affected batches in registration order, maintaining
+            # the current value of every touched key.  Events from unaffected,
+            # still-effective batches are applied unconditionally; affected
+            # batches are re-evaluated against this reconstructed state.
+            values = dict(boundary)
+            new_status: dict[str, str] = {}
+            affected_order = sorted(affected.items())   # (seq, batch_id)
+            outside = events["events"]           # (bseq, bid, write-row, pk)
+            oi = 0
+            for bseq, bid in affected_order:
+                while oi < len(outside) and outside[oi][0] < bseq:
+                    _, _, wrow, pk = outside[oi]
+                    values[pk] = self._event_value(wrow)
+                    oi += 1
+
+                if bid == batch_id:
+                    new_status[bid] = WITHDRAWN
+                    continue
+                conds = conn.execute(_CONDITIONS_OF_SQL, (bid,)).fetchall()
+                audit.journal_rows_read += len(conds)
+                holds = True
+                for c in conds:
+                    cur = values.get(c["pk"], _ABSENT)
+                    if c["kind"] == "absent":
+                        if cur is not _ABSENT:
+                            holds = False
+                            break
+                    else:
+                        if cur is _ABSENT or cur[0] != c["route"] or cur[1] != c["payload"]:
+                            holds = False
+                            break
+                if not holds:
+                    new_status[bid] = SKIPPED
+                    continue
+                new_status[bid] = REGISTERED
+                for wrow in conn.execute(_WRITES_OF_SQL, (bid,)).fetchall():
+                    audit.journal_rows_read += 1
+                    values[wrow["pk"]] = self._event_value(wrow)
+            while oi < len(outside):
+                _, _, wrow, pk = outside[oi]
+                values[pk] = self._event_value(wrow)
+                oi += 1
+
+            # (4) Real row difference vs the live table, restricted to keys
+            # whose final value can have changed.  Each is one point lookup.
+            before, after, written_pks = {}, {}, set()
+            for pk in sorted(touched):
+                live = conn.execute(_RECORD_POINT_SQL, (pk,)).fetchone()
+                audit.point_lookups += 1
+                final_value = values.get(pk, _ABSENT)
+                if final_value is _ABSENT:
+                    final_row = None
+                else:
+                    final_row = {"pk": pk, "route": final_value[0],
+                                 "payload": final_value[1]}
+                if self._same_row(live, final_row):
+                    continue
+                written_pks.add(pk)
+                if live is not None:
+                    before[pk] = live
+                if final_row is not None:
+                    after[pk] = final_row
+                if final_row is None:
+                    conn.execute("DELETE FROM records WHERE pk = ?", (pk,))
+                else:
+                    conn.execute(
+                        "INSERT INTO records (pk, route, payload) VALUES (?, ?, ?) "
+                        "ON CONFLICT(pk) DO UPDATE SET route = excluded.route, "
+                        "payload = excluded.payload",
+                        (pk, final_row["route"], final_row["payload"]),
+                    )
+
+            # (5) Persist the new statuses and publish one net correction.
+            now = time.time()
+            for bid, status in new_status.items():
+                notify = None
+                if status == REGISTERED:
+                    notify = conn.execute(
+                        "SELECT notify_seq FROM batches WHERE batch_id = ?", (bid,)
+                    ).fetchone()["notify_seq"]
+                conn.execute(
+                    "UPDATE batches SET status = ?, notify_seq = ?, last_change_at = ? "
+                    "WHERE batch_id = ?",
+                    (status, notify, now, bid),
+                )
+
+            changes_by_sub = {}
+            notify_seq = None
+            if written_pks:
+                change_audit = ReadAudit()
+                change_audit.point_lookups = audit.point_lookups
+                subs = {r["name"]: r for r in self._all_subs(conn)}
+                changes_by_sub = self._net_changes_for_subs(
+                    conn, subs, {}, before, after, written_pks, change_audit
+                )
+                if changes_by_sub:
+                    notify_seq = self._store_commit(
+                        conn, changes_by_sub,
+                        {"kind": "withdrawal", "batch_id": batch_id},
+                        {}, subs, change_audit,
+                        extra_audit={"withdrawal": audit.to_dict()},
+                    )
+
+            audit.read_batches = sorted(read_ids)
+            return WithdrawResult(
+                batch_id, changed=True, notify_seq=notify_seq,
+                changes=changes_by_sub,
+                statuses=self._batch_statuses(conn, set(affected.values())),
+                audit=audit,
+            )
+
+    # -- batch journal helpers ---------------------------------------------
+    def _batch_keys(self, conn, batch_id, audit):
+        """Distinct primary keys a batch references in conditions or writes."""
+        return set(self._condition_keys(conn, batch_id, audit)) | set(
+            self._write_keys(conn, batch_id, audit)
+        )
+
+    def _condition_keys(self, conn, batch_id, audit):
+        keys = []
+        for c in conn.execute(_CONDITIONS_OF_SQL, (batch_id,)).fetchall():
+            audit.journal_rows_read += 1
+            keys.append(c["pk"])
+        return keys
+
+    def _write_keys(self, conn, batch_id, audit):
+        keys = []
+        for w in conn.execute(_WRITES_OF_SQL, (batch_id,)).fetchall():
+            audit.journal_rows_read += 1
+            keys.append(w["pk"])
+        return keys
+
+    def _referencing_write_batches(self, conn, keys, target_seq, audit):
+        """Later batches that *write* any of ``keys`` (indexed pk lookups)."""
+        return self._referencing_via(
+            conn, keys, target_seq, audit, _WRITE_REFS_SQL
+        )
+
+    def _referencing_condition_batches(self, conn, keys, target_seq, audit):
+        """Later batches that read any of ``keys`` as a precondition."""
+        return self._referencing_via(
+            conn, keys, target_seq, audit, _COND_REFS_SQL
+        )
+
+    def _referencing_via(self, conn, keys, target_seq, audit, sql_template):
+        """Later batches referencing ``keys`` through one journal table.
+
+        The backing index leads with ``pk``, so this stays an indexed lookup as
+        the key set grows, rather than a journal scan.  Returns
+        ``[(seq, batch_id, status), ...]`` for batches after the target.
+        """
+        if not keys:
+            return []
+        marks = ",".join("?" for _ in keys)
+        ids = {
+            row["batch_id"]
+            for row in conn.execute(
+                sql_template.format(marks=marks), list(keys)
+            ).fetchall()
+        }
+        audit.journal_rows_read += len(ids)
+        out = []
+        for bid in ids:
+            brow = conn.execute(_BATCH_BY_ID_SQL, (bid,)).fetchone()
+            if brow["seq"] > target_seq:
+                out.append((brow["seq"], bid, brow["status"]))
+        return out
+
+    def _key_timelines(self, conn, keys, affected, audit):
+        """Reconstruct per-key history for the re-evaluation walk.
+
+        ``boundary`` is each key's value at the enable-time baseline (absent
+        keys are simply omitted).  ``events`` lists write events from batches
+        outside the affected closure that are still effective, ordered by
+        registration sequence; affected-batch writes are applied during the
+        walk itself.
+        """
+        from .batches import REGISTERED
+
+        boundary = {}
+        for pk in keys:
+            row = conn.execute(_BASELINE_POINT_SQL, (pk,)).fetchall()
+            audit.baseline_lookups += 1
+            if row:
+                r = row[0]
+                boundary[pk] = (r["route"], r["payload"])
+
+        marks = ",".join("?" for _ in keys)
+        events = []
+        read_batches = set()
+        affected_ids = set(affected.values())
+        for row in conn.execute(
+            _JOURNAL_EVENTS_SQL.format(marks=marks), list(keys)
+        ).fetchall():
+            audit.journal_rows_read += 1
+            if row["status"] != REGISTERED:
+                continue
+            if row["batch_id"] in affected_ids:
+                continue
+            read_batches.add(row["batch_id"])
+            events.append((row["bseq"], row["batch_id"], row, row["pk"]))
+        events.sort(key=lambda e: (e[0], e[2]["idx"]))
+        return boundary, {"events": events, "read_batches": read_batches}
+
+    @staticmethod
+    def _event_value(wrow):
+        """The (route, payload) a write event leaves behind, or ``_ABSENT``."""
+        if wrow["is_delete"]:
+            return _ABSENT
+        return (wrow["route"], wrow["payload"])
+
+    @staticmethod
+    def _same_row(live, final_row):
+        if live is None and final_row is None:
+            return True
+        if live is None or final_row is None:
+            return False
+        return (live["route"] == final_row["route"]
+                and live["payload"] == final_row["payload"])
+
+    def _batch_statuses(self, conn, ids):
+        from .batches import BatchStatus
+
+        out = []
+        if not ids:
+            return out
+        marks = ",".join("?" for _ in ids)
+        for row in conn.execute(
+            f"SELECT batch_id, seq, status, fingerprint, notify_seq, created_at, "
+            f"last_change_at FROM batches WHERE batch_id IN ({marks}) ORDER BY seq",
+            list(ids),
+        ).fetchall():
+            cc = conn.execute(
+                "SELECT count(*) FROM batch_conditions WHERE batch_id = ?",
+                (row["batch_id"],),
+            ).fetchone()[0]
+            wc = conn.execute(
+                "SELECT count(*) FROM batch_writes WHERE batch_id = ?",
+                (row["batch_id"],),
+            ).fetchone()[0]
+            out.append(BatchStatus(
+                row["batch_id"], row["seq"], row["status"], row["fingerprint"],
+                cc, wc, row["notify_seq"], row["created_at"], row["last_change_at"],
+            ))
+        return out
+
+    def batch_status(self, batch_id: str):
+        """Return one batch's journal status; ``KeyError`` if unknown."""
+        with read_transaction(self.conn) as conn:
+            if self._meta_value(conn, "batch_mode") != "on":
+                raise RuntimeError("batch journaling is not enabled")
+            statuses = self._batch_statuses(conn, (batch_id,))
+        if not statuses:
+            raise KeyError(f"unknown batch {batch_id!r}")
+        return statuses[0]
+
+    def batches(self) -> list:
+        """All registered batches in first-registration order."""
+        with read_transaction(self.conn) as conn:
+            if self._meta_value(conn, "batch_mode") != "on":
+                return []
+            rows = conn.execute(
+                "SELECT batch_id FROM batches ORDER BY seq"
+            ).fetchall()
+            return self._batch_statuses(conn, [r["batch_id"] for r in rows])
+

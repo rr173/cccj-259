@@ -10,10 +10,11 @@ SQLite 文件里。质检员按半开整数区间订阅货号（`[lo, hi)`），
 feedtable/
   db.py         schema + 事务封装（BEGIN IMMEDIATE / 读快照）
   intervals.py  半开区间与集合差
-  core.py       Feed：建订、提交事务、读取通告、确认
+  batches.py    批次值对象、前置条件与内容指纹
+  core.py       Feed：建订、提交事务、读取通告、确认、批次登记与撤回
   cli.py        命令行（每次调用一个进程，模拟随时崩溃的运维方式）
 examples/consumer.py   只用投递内容的参考消费者
-tests/                 57 个可执行检查（含随机差分测试）
+tests/                 102 个可执行检查（含随机差分测试）
 ```
 
 ## 快速开始
@@ -140,18 +141,132 @@ python -m feedtable --db roster.db ack qc-a 3
 - `plan` 来自 `EXPLAIN QUERY PLAN`，且 SQL 用 `INDEXED BY` 固定索引，
   schema 变化不会悄悄退化成全表扫描。
 
+## 批次登记与按编号撤回
+
+质检员发现某批货号资料采错时，可以在**现有数据库**上启用批次登记，之后按批次号
+撤回：撤回后仓表的结果等同于「从未收过这一批」，但此后仍然成立的后续批次会保留。
+订阅客户端**不需要清库或重新建订**，只会收到一组按净行差异生成的纠正通告。
+
+### 启用
+
+```python
+feed.enable_batches()
+```
+
+启用时把当前整张 `records` 快照到 `baseline_records`，作为**不可撤回的起点**：
+启用之前的写入不追认、也无法撤回。启用之后，记录的增删改只能通过批次入口提交；
+`apply()` 若携带记录写入会被明确拒绝且不产生任何变化（纯区间挪动、建订、读取、确认
+照常使用）。启用是幂等的。
+
+### 批次结构
+
+一个批次 (`BatchRequest`) 包含：
+
+- 唯一编号 `batch_id`；
+- 一组**可为空**的前置条件 `Condition`：
+  - `Condition.absent(pk)`：要求该主键在仓表中**不存在**（存在但 `payload` 为
+    `NULL` 仍是一行，不满足）；
+  - `Condition.matches(pk, route, payload)`：要求存在一行且 `route`、`payload`
+    与指定值**完全相同**，按仓表现有的行/值语义比较；
+- 一组**非空**的记录写入 `RowSpec`，沿用既有的完整写入/删除语义；每个主键在一批
+  只写一次，否则请求被拒绝。
+
+所有条件都看本批生效前的仓表。全部满足才整批生效；否则一行不写，但该批仍会登记
+（状态 `skipped`），保留首次登记顺序。
+
+```python
+from feedtable import BatchRequest, Condition
+
+result = feed.submit_batch(BatchRequest(
+    "jia",
+    (Condition.matches("mark", 5, {"flag": "ok"}),),
+    (RowSpec("d1", 6, {"v": 1}), RowSpec("d2", 7, {"v": 2})),
+))
+result.applied          # 条件是否满足、写入是否生效
+result.notify_seq       # 生效且有可观察变化时的通告序号，否则 None
+```
+
+同编号、同内容重试不重新登记（`registered=False`）；同编号、不同内容冲突则拒绝，
+无效请求不改变数据库。内容身份由规范化指纹 `batch_fingerprint` 决定（条件顺序无关，
+JSON 键序无关）。
+
+### 撤回与重新判断
+
+```python
+out = feed.withdraw_batch("jia")
+out.audit.read_batches      # 本次实际读取了条件/写入明细的不同批次编号
+```
+
+撤回以启用时的仓表为起点理解结果：跳过所有已撤回批次，其余按**最初登记顺序**重新
+判断。原来没通过的批次可能因此生效，原先生效的也可能整批失效；`batch_status` /
+`batches` 反映最新结果（`registered` / `skipped` / `withdrawn`）。可以连续撤回不同
+批次；重复撤回同一编号不再产生变化，未知编号报错。
+
+例如甲写入校验标记、乙仅在标记存在且值符合预期时补录两条资料、丙在其中一条资料不
+存在时转入待复核；撤回甲以后，乙的两条都不会留下，丙转而生效。
+
+### 撤回的读取代价
+
+撤回**不会全量扫仓表，也不会逐批读完整历史**。系统沿登记顺序按主键做闭包追踪：
+一批写入的主键，只可能影响后来「把该键读作条件」或「写该键」的批次。允许重读撤回批
+的条件/写入明细，以及沿这条链间接影响到的未撤回批；判断条件与净变化所需的历史行值
+通过主键点查和启用基线取得。每次撤回返回的 `audit.read_batches` 列出**实际**打开过的
+不同批次编号，便于检验无关批次没有被重放（长历史中这通常只占很小一部分）。
+
+### 通告与原子性
+
+一次撤回只按操作前、后的**实际行差异**向现有订阅发布纠正，沿用当前订阅区间和通告
+规则：同一订阅只看到一组净变化，没有可见差异就不另发通告；旧起始视图、在途通告和已
+确认进度保持原样。普通批次写入也照常产生通告。批次状态、当前仓表和新通告在同一个
+SQLite 事务中落定，中断重开不会看到只更正了一部分的结果。
+
+### 命令行
+
+```bash
+python -m feedtable --db roster.db enable-batches
+python -m feedtable --db roster.db batch-submit --tx batch.json
+python -m feedtable --db roster.db batch-withdraw jia
+python -m feedtable --db roster.db batch-status          # 整个登记册
+python -m feedtable --db roster.db batch-status jia      # 单个批次
+```
+
+`batch.json` 形如：
+
+```json
+{
+  "batch_id": "jia",
+  "conditions": [{"pk": "mark", "kind": "matches", "route": 5, "payload": {"flag": "ok"}}],
+  "writes": [
+    {"pk": "d1", "route": 6, "payload": {"v": 1}},
+    {"pk": "ghost", "delete": true}
+  ]
+}
+```
+
 ## 验证
 
 ```bash
 python3 -m unittest discover -s tests -t . -v
 ```
 
-覆盖内容（共 62 项）：
+覆盖内容（共 102 项）：
 
 - **区间代数**（`test_intervals.py`）：半开边界、两段差集。
 - **语义**（`test_feed.py`）：净变化、单主键单变更、挪区间不重建、写入与挪动同事务、
   读取代价、索引计划、**SQL 语句级追踪**（事务内对 `records` 的每条语句只可能是
   按主键点查或固定索引的双边界区间查询，且无 `SCAN records`）、大 payload。
+- **批次登记**（`test_batches.py`）：启用快照与幂等、启用后旧写接口被拒且无变化、
+  前置条件（含「NULL 行不等于不存在」与精确匹配）、失败仍登记、同编号幂等/冲突、
+  登记顺序、生效才发通告。
+- **批次撤回**（`test_withdrawal.py`）：甲/乙/丙示例、净纠正通告、连续撤回、重复与
+  未知编号、跳过批撤回、状态翻转、无可见差异不发通告、只重放受影响批次、起始视图与
+  确认进度保持原样。
+- **批次持久化与读取代价**（`test_batch_durability.py`）：撤回失败整体回滚、重开后
+  状态与纠正可复查、撤回期间对仓表/登记册只有点查和固定索引查询（无全表扫描）、
+  索引计划、CLI 全流程。
+- **批次随机差分测试**（`test_batch_differential.py`）：内置从启用基线全量重放的参考
+  实现，随机登记与撤回多轮；逐步比对仓表、批次状态、订阅变化，并校验撤回实际读取的
+  批次集合与按键影响闭包完全一致。
 - **持久化与原子性**（`test_durability.py`）：部分确认后「崩溃」重放、历史组不被重算、
   另一连接看不到未提交事务、失败事务不留痕、审计随提交持久化并可复查、CLI 全流程。
 - **运维流程**（`test_workflow.py`）：未消费起始视图时先挪区间、多订阅互不干扰、
